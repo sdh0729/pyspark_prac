@@ -1,0 +1,425 @@
+#spark.read.csv() 메소드를 이용하여 csv 파일을 로드하고 DataFrame으로 변환. 
+# pandas_df = pd.read_csv('/FileStore/tables/titanic_train.csv', header='infer')
+titanic_sdf = spark.read.csv('/FileStore/tables/titanic_train.csv', header=True, inferSchema=True)
+
+# pandas DataFrame을 spark DataFrame으로 부터 생성. 
+titanic_pdf = titanic_sdf.select('*').toPandas()
+
+display(titanic_sdf.limit(10))
+
+titanic_pdf.info()
+
+# titanic_sdf 의 schema 확인
+titanic_sdf.printSchema()
+
+# 컬럼별로 Null 인 경우만 count하는 select 로직.
+import pyspark.sql.functions as F
+
+titanic_sdf.select([F.count(F.when(F.col(c).isNull()|F.isnan(c), c)).alias(c) for c in titanic_sdf.columns]).show()
+
+display(titanic_sdf.describe())
+
+print("#### Survived value count #### ")
+print(titanic_sdf.groupBy('Survived').count().show())
+print("#### Pclass value count #####")
+print(titanic_sdf.groupBy('Pclass').count().show())
+
+groupby_cols = ['Survived', 'Pclass', 'Sex', 'Ticket', 'Cabin', 'Embarked']
+
+for groupby_col in groupby_cols:
+    print('##### ' + groupby_col + ' value counts ######')
+    titanic_sdf.groupBy(groupby_col).count().show()
+
+import matplotlib.pyplot as plt
+
+titanic_pdf['Age'].hist() # titanic_sdf.select('Age').hist()는 동작하지 않음. 
+plt.show()
+
+# Pandas API on Spark 적용
+import pyspark.pandas as ps
+
+# spark DataFrame에서 Spark pandas DataFrame으로 변경. 
+psdf = titanic_sdf.to_pandas_on_spark() # pandas DataFrame으로 부터 변경할 경우는 psdf = ps.from_pandas(titanic_pdf) 
+print(type(psdf))
+
+psdf['Age'].hist()
+
+# SQL 사용을 위해서 Spark DataFrame을 View형태로 변환
+titanic_sdf.createOrReplaceTempView('titanic_view')
+
+%sql
+select survived, count(*) as cnt from titanic_view group by survived order by 2 desc
+
+%sql
+select cabin, count(*) as cnt from titanic_view group by cabin order by 2 desc
+
+%sql
+select case when cabin is null then 'NA' else cabin end as cabin from titanic_view
+
+%sql
+select age_bin, count(*)  cnt
+from (
+  select floor(age/10.0)*10 as age_bin from titanic_view
+) group by age_bin order by 2 desc;
+
+
+%sql
+/*
+select age, floor(age/10.0)*10 as age_bin from titanic_view;
+
+select age_bin, count(*)  cnt
+from (
+  select floor(age/10.0)*10 as age_bin from titanic_view
+) group by age_bin order by 2 desc;
+
+
+select age_bin, age_bin||'-'||(age_bin+10) as age_bin_range, count(*)  cnt
+from (
+  select floor(age/10.0)*10 as age_bin from titanic_view
+) group by age_bin order by 3 desc;
+
+select age_bin||'-'||(age_bin+10) as age_bin_range, cnt
+from (
+  select floor(age/10.0)*10 as age_bin, count(*) cnt
+  from titanic_view group by 1
+) order by cnt desc
+*/
+
+%sql
+select age_bin||'-'||(age_bin+10) as age_bin_range, cnt
+from (
+  select floor(age/10.0)*10 as age_bin, count(*) cnt
+  from titanic_view group by 1
+) order by cnt desc
+
+%sql
+select fare_bin||'-'||(fare_bin+10) as fare_bin_range, cnt
+from (
+  select floor(fare/10.0)*10 as fare_bin, count(*) cnt
+  from titanic_view group by 1
+) order by cnt desc
+
+titanic_sdf.groupBy('Survived', 'Sex').count().show()
+
+%sql
+
+select survived, sex, count(*) from titanic_view group by survived, sex
+
+%sql
+select pclass, sex, survived, count(*) cnt from titanic_view group by pclass, sex, survived order by 1, 2, 3
+
+%sql
+
+select pclass, sex, 
+count(case when survived = 0 then 1 else Null end) cnt_non_survived,
+count(case when survived = 1 then 1 else Null end) cnt_survived from titanic_view group by pclass, sex order by 1, 2
+/*
+select pclass, sex, 
+sum(case when survived = 0 then 1 else 0 end) cnt_non_survived,
+sum(case when survived = 1 then 1 else 0 end) cnt_survived from titanic_view group by pclass, sex order by 1, 2
+*/
+
+# 일반 python용 UDF를 작성. 반드시 입력 값과 반환 값을 설정
+def get_category(age):
+    cat = ''
+    
+    # age 값이 None일 경우는 NA를 Return
+    if age == None:
+        return 'NA'
+    
+    if age <= 5: cat = 'Baby'
+    elif age <= 12: cat = 'Child'
+    elif age <= 18: cat = 'Teenager'
+    elif age <= 25: cat = 'Student'
+    elif age <= 35: cat = 'Young Adult'
+    elif age <= 60: cat = 'Adult'
+    else : cat = 'Elderly'
+    
+    return cat
+
+from pyspark.sql.functions import udf,col
+from pyspark.sql.types import StringType
+
+# 일반 python용 UDF를 pyspark용 UDF로 변환. udf(lambda 입력변수: 일반 UDF, 해당 일반 UDF의 반환형)
+udf_get_category = udf(lambda x:get_category(x), StringType() )
+# udf_get_category()에 Age 컬럼값을 입력하여 반환되는 값으로 새로운 컬럼 Age_Category를 생성
+
+titanic_sdf = titanic_sdf.withColumn("Age_Category",udf_get_category(col("Age")))
+titanic_sdf.show()
+
+'''
+#아래와 같이 when otherwise 를 이용해서도 변환 가능. 
+from pyspark.sql.functions import when
+                   
+titanic_sdf_filled_02 = titanic_sdf.withColumn('Age_category', when(F.col('Age') <= 5, 'Baby')
+                                                                      .when(F.col('Age') <= 12, 'Child')
+                                                                      .when(F.col('Age') <= 18, 'Teenage')
+                                                                      .when(F.col('Age') <= 25, 'Student')
+                                                                      .when(F.col('Age') <= 35, 'Young Adult')
+                                                                      .when(F.col('Age') <= 60, 'Adult')
+                                                                      .when(F.col('Age').isNull(), 'NA')
+                                                                      .otherwise('Elderly'))
+'''
+
+%sql
+-- 새로운 컬럼을 추가시 View에 자동 반영되지 않음. 
+select * from titanic_view
+
+titanic_sdf.createOrReplaceTempView('titanic_view')
+
+%sql
+select * from titanic_view
+
+%sql
+select age_category, survived, sex, count(*) cnt from titanic_view group by  age_category, survived, sex order by cnt desc
+
+import pyspark.sql.functions as F
+
+avg_age = titanic_sdf.select(F.avg(F.col('Age')))
+avg_age_row = avg_age.first() # avg_age.head()와 동일. 
+avg_age_value = avg_age.first()[0]
+
+print(avg_age, avg_age_row, avg_age_value)
+print(avg_age.show())
+
+titanic_sdf = titanic_sdf.fillna({'Age':titanic_sdf.select(F.avg(F.col('Age'))).first()[0],
+                   'Cabin': 'N',
+                   'Embarked': 'N'
+                   })
+display(titanic_sdf.limit(20))
+
+# age의 Null값을 평균으로 대체했으므로 Age_Category 컬럼도 재 생성
+titanic_sdf = titanic_sdf.withColumn("Age_Category",udf_get_category(col("Age")))
+
+# DataFrame에서도 display()로 감쌀 경우 databricks의 내장 그래프 기능을 사용할 수 있음. 
+display(titanic_sdf.groupBy('age_category', 'survived', 'sex').count())
+
+
+# Cabin 컬럼은 맨 앞자리 문자로 대체. 컬럼 update시에 withColumn() 메소드 적용. 
+titanic_sdf = titanic_sdf.withColumn('Cabin', F.substring(F.col('Cabin'), 0, 1))
+display(titanic_sdf.limit(10))
+
+def fill_n_transform_columns(titanic_sdf):
+    titanic_sdf = titanic_sdf.fillna({'Age':titanic_sdf.select(F.avg(F.col('Age'))).first()[0],
+                                      'Cabin': 'N',
+                                      'Embarked':'N' 
+                                     })
+
+    titanic_sdf = titanic_sdf.withColumn("Age_Category",udf_get_category(col("Age")))
+    titanic_sdf = titanic_sdf.withColumn('Cabin', F.substring(F.col('Cabin'), 0, 1))
+    
+    return titanic_sdf
+
+titanic_sdf = fill_n_transform_columns(titanic_sdf)
+display(titanic_sdf.limit(10))
+
+# null 값이 있는지 재 확인. 
+titanic_sdf.select([F.count(F.when(F.col(c).isNull()|F.isnan(c), c)).alias(c) for c in titanic_sdf.columns]).show()
+
+# 특정 컬럼들을 삭제하기. VectorAssembler 로 변환된 feature vector만 학습/예측에 참여하므로 여기서 삭제하지 않고 나중에 feature vectorization 때 제외해도 무방. 
+def drop_columns(sdf, drop_cols=None):
+    # drop_cols는 인자로 list가 입력되나 Spark DataFrame의 drop() 메소드는 인자로 컬럼명 문자열을 입력 받음. 
+    sdf = sdf.drop(*drop_cols)
+    return sdf
+
+titanic_sdf = drop_columns(titanic_sdf, drop_cols=['PassengerId', 'Name', 'Ticket'])
+
+display(titanic_sdf.limit(10))
+
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+
+def label_encode_columns(sdf, input_cols=None):
+    
+    output_cols = [ 'label_'+col for col in input_cols]
+    string_indexer = StringIndexer(inputCols=input_cols, outputCols=output_cols)
+    sdf = string_indexer.fit(sdf).transform(sdf)
+    
+    return sdf
+
+def onehot_encode_columns(sdf, input_cols=None):
+    
+    label_cols = ['label_'+col for col in input_cols]
+            
+    string_indexer = StringIndexer(inputCols=input_cols, outputCols=label_cols)
+    sdf = string_indexer.fit(sdf).transform(sdf)
+    # sdf = label_encode_columns(sdf, input_cols)
+    
+    output_cols = ['onehot_'+col for col in input_cols]
+    onehot_encoder = OneHotEncoder(inputCols=label_cols, outputCols=output_cols)
+    sdf = onehot_encoder.fit(sdf).transform(sdf)
+    # one hot encoding 하기 위해 생성한 label encoding된 컬럼을 삭제
+    sdf = sdf.drop(*label_cols)
+    
+    return sdf
+
+titanic_sdf_enc_01 = label_encode_columns(titanic_sdf.select('*'), input_cols=['Age_Category', 'Cabin', 'Sex', 'Embarked'])
+titanic_sdf_enc_01.show()
+
+titanic_sdf_enc_01 = onehot_encode_columns(titanic_sdf.select('*'), input_cols=['Age_Category', 'Cabin', 'Sex', 'Embarked'])
+display(titanic_sdf_enc_01)
+
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml import Pipeline
+
+# Pipeline을 이용한 Encoding 함수. 
+def encode_columns(sdf, input_cols=None, encode_gubun='label'):
+    # label encoding과 one hot encoding 변환 컬럼명 지정. 
+    label_cols = ['label_'+col for col in input_cols]
+    onehot_cols = ['onehot_'+col for col in input_cols]
+    
+    #pipeline의 stages로 지정된 StringIndexer와 OneHotEncoder 객체 생성. 
+    label_encoder_stage = StringIndexer(inputCols=input_cols, outputCols=label_cols)
+    onehot_encoder_stage = OneHotEncoder(inputCols=label_cols, outputCols=onehot_cols)
+    
+    # encode_gubun이 label이면 StringIndexer stage만 등록, onehot이면 StringIndexer, OneHotEncoder 모두 등록. 
+    stages = []
+    if encode_gubun == 'label':
+        stages = [label_encoder_stage]
+    else:
+        stages = [label_encoder_stage, onehot_encoder_stage]
+        
+    pipeline = Pipeline(stages=stages)
+    sdf = pipeline.fit(sdf).transform(sdf)
+    
+    return sdf
+  
+titanic_sdf_encode_02 = encode_columns(titanic_sdf.select('*'), input_cols=['Age_Category', 'Cabin', 'Sex', 'Embarked'], encode_gubun='onehot')
+display(titanic_sdf_encode_02.limit(10))
+
+# titanic 데이터 세트를 다시 spark DataFrame으로 재로딩하고 데이터 사전 가공, Encoding 작업 진행. 
+titanic_sdf = spark.read.csv('/FileStore/tables/titanic_train.csv', header=True, inferSchema=True)
+
+titanic_sdf = fill_n_transform_columns(titanic_sdf)
+titanic_sdf = encode_columns(titanic_sdf, input_cols=['Age_Category', 'Cabin', 'Sex', 'Embarked'], encode_gubun='label')
+
+# schema 확인 및 Null 값 확인. 
+titanic_sdf.printSchema()
+titanic_sdf.select([F.count(F.when(F.col(c).isNull()|F.isnan(c), c)).alias(c) for c in titanic_sdf.columns]).show()
+display(titanic_sdf.limit(10))
+
+# feature vectorization 적용할 column명 추출. 문자열 컬럼 제외, label 컬럼인 Survived는 제외, 불필요한 PassengerId 컬럼 제외
+drop_columns = [column_name for column_name, column_type in titanic_sdf.dtypes if column_type == 'string']
+drop_columns += ['Survived', 'PassengerId']
+print('삭제될 columns:', drop_columns)
+
+# titanic_sdf Dataframe 컬럼에서 삭제될 컬럼을 제외.  
+vector_columns = [column for column in titanic_sdf.columns if column not in drop_columns]
+print('vector화될 columns:', vector_columns)
+
+# feature vector화 적용 후 train과 test 데이터 세트로 분리. 
+from pyspark.ml.feature import VectorAssembler
+
+vector_assembler = VectorAssembler(inputCols=vector_columns, outputCol='features')
+titanic_sdf = vector_assembler.transform(titanic_sdf)
+
+# Pipeline을 적용하지 않을 것이면 전체 데이터를 feature vector화 한 후에 train과 test 데이터 세트로 분리하는게 조금 더 편리. 
+train_sdf , test_sdf = titanic_sdf.randomSplit([0.8, 0.2], seed=11)
+display(train_sdf.limit(10))
+
+
+# 학습 데이터로 학습 후 테스트 데이터로 예측 
+from pyspark.ml.classification import DecisionTreeClassifier
+
+dt_estimator = DecisionTreeClassifier(featuresCol='features', labelCol='Survived')
+dt_model = dt_estimator.fit(train_sdf)
+# test_sdf는 이미 feature vector화 되어 있으므로 별도의 feature vector화 작업 불필요. 
+predictions = dt_model.transform(test_sdf)
+
+display(predictions)
+
+# 테스트 데이터의 예측 성능 정확도 평가
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+accuracy_evaluator = MulticlassClassificationEvaluator(labelCol='Survived', predictionCol='prediction', metricName='accuracy')
+print('정확도:', accuracy_evaluator.evaluate(predictions))
+
+
+dt_estimator.__class__.__name__
+
+# estimator 별로 학습/예측/평가를 수행하기 위한 함수 생성. 
+def train_test_eval(estimator, train_sdf, test_sdf, evaluator):
+    estimator_model = estimator.fit(train_sdf)
+    predictions = estimator_model.transform(test_sdf)
+    accuracy = evaluator.evaluate(predictions)
+    print(estimator.__class__.__name__, ' 정확도:', accuracy)
+
+# 이미 titanic_sdf에 features 컬럼이 있으면 이를 drop
+titanic_sdf = titanic_sdf.drop('features')
+
+vector_assembler = VectorAssembler(inputCols=vector_columns, outputCol='features')
+titanic_sdf = vector_assembler.transform(titanic_sdf)
+train_sdf , test_sdf = titanic_sdf.randomSplit([0.8, 0.2], seed=11)
+
+dt_estimator = DecisionTreeClassifier(featuresCol='features', labelCol='Survived')
+accuracy_evaluator = MulticlassClassificationEvaluator(labelCol='Survived', predictionCol='prediction', metricName='accuracy')
+
+train_test_eval(dt_estimator, train_sdf, test_sdf, accuracy_evaluator)
+    
+    
+
+# 여러 classifier를 학습 후 성능 테스트 
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier
+
+# 학습/예측/평가를 수행한 Estimator 객체들을 생성. 결정 트리, 랜덤 포레스트, 로지스틱 회귀로 테스트 
+estimators = [DecisionTreeClassifier(featuresCol='features', labelCol='Survived'),
+              RandomForestClassifier(featuresCol='features', labelCol='Survived'),
+              LogisticRegression(featuresCol='features', labelCol='Survived')
+             ]
+
+for estimator in estimators:
+    train_test_eval(estimator, train_sdf, test_sdf, accuracy_evaluator)
+
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+
+dt_estimator = DecisionTreeClassifier(featuresCol='features', labelCol='Survived')
+
+#CrossValidator에서 하이퍼파라미터 튜닝을 위한 그리드 서치(Grid Search)용 ParamGrid 생성.
+# Spark ML DecisionTreeClassifier의 maxDepth는 max_depth, minInstancesPerNode는 min_samples_split(노드 분할 시 최소 sample 건수)
+dt_param_grid = ParamGridBuilder().addGrid(dt_estimator.maxDepth, [2, 3, 5, 7, 10])\
+                               .addGrid(dt_estimator.minInstancesPerNode, [2, 3, 4,  5])\
+                               .build()
+accuracy_evaluator = MulticlassClassificationEvaluator(labelCol='Survived', predictionCol='prediction', metricName='accuracy')
+
+cv = CrossValidator(estimator=dt_estimator, estimatorParamMaps=dt_param_grid, evaluator=accuracy_evaluator, numFolds=3)
+cv_model = cv.fit(train_sdf)
+
+import pandas as pd
+
+# 교차 검증 결과를 pandas DataFrame으로 반환하는 함수 생성. 
+def get_cv_result_pdf(cv_model):
+    params = [{p.name: v for p, v in m.items()} for m in cv_model.getEstimatorParamMaps()]
+
+    cv_result_pdf= pd.DataFrame({'params': params, 'evaluation_result':cv_model.avgMetrics })
+    
+    return cv_result_pdf
+
+result_pdf = get_cv_result_pdf(cv_model)
+display(result_pdf)
+
+#test_sdf는 이미 feature vector화 되어 있음. 
+predictions = cv_model.transform(test_sdf)
+
+print("\n##### cv_model로 테스트 데이터 예측 결과 ######")
+accuracy_evaluator = MulticlassClassificationEvaluator(labelCol='Survived', predictionCol='prediction', metricName='accuracy')
+print('테스트 데이터 세트 정확도:', accuracy_evaluator.evaluate(predictions))
+
+display(predictions)
+
+def cv_train_test_eval(train_sdf, test_sdf, estimator, param_grid, evaluator, num_folds):
+    cv = CrossValidator(estimator=estimator, estimatorParamMaps=param_grid, evaluator=evaluator, numFolds=num_folds)
+    cv_model = cv.fit(train_sdf)
+    cv_result_pdf = get_cv_result_pdf(cv_model)
+    
+    predictions = cv_model.transform(test_sdf)
+    test_accuracy = evaluator.evaluate(predictions)
+    
+    return cv_result_pdf, test_accuracy
+    
+cv_result_pdf, test_accuracy = cv_train_test_eval(train_sdf, test_sdf, 
+                                                  dt_estimator, dt_param_grid, accuracy_evaluator, num_folds=5)
+print('테스트 데이터 세트 정확도:', test_accuracy)
+display(cv_result_pdf)
+
+    
+
+
